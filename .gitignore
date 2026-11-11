@@ -1,0 +1,9 @@
+.*
+*.log
+secrets/
+.claude/
+
+!.github
+!.gitignore
+!.dockerignore
+!.env.example

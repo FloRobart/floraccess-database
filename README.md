@@ -1,0 +1,303 @@
+# FlorAccess — Base de données
+
+Ce dépôt contient **tout ce qui concerne la base de données** de FlorAccess :
+
+- les migrations du schéma PostgreSQL, gérées avec [dbmate](https://github.com/amacneil/dbmate) ;
+- l'image Docker de migrations `florobart/floraccess-migrations` ;
+- les fichiers Docker Compose pour lancer la base en développement et en production.
+
+L'API (`floraccess-api`) ne contient rien sur la base : elle s'y connecte par un réseau Docker. En production, c'est le réseau interne `floraccess-database-net`, déclaré à l'identique dans les deux dépôts ; en développement, c'est `floraccess-net`, créé par `docker-compose.dev.yml`.
+
+# Table des matières
+
+- [Structure](#structure)
+- [Principe](#principe)
+- [Règles à respecter](#règles-à-respecter)
+- [Développement](#développement)
+- [Créer une migration](#créer-une-migration)
+- [Publier l'image de migrations](#publier-limage-de-migrations)
+- [Déployer en production](#déployer-en-production)
+- [En cas de problème](#en-cas-de-problème)
+- [Basculer une base existante](#basculer-une-base-existante)
+
+# Structure
+
+```
+floraccess-database/
+├── db/
+│   ├── migrations/          ← une migration = un fichier, horodaté, immuable
+│   └── schema.sql           ← état complet de la base, généré par dbmate (ne pas modifier à la main)
+├── .github/                 ← CI (test des migrations + publication de l'image) et Dependabot
+├── Dockerfile               ← image de migrations (dbmate + db/migrations)
+├── docker-compose.yml       ← production : postgres + migrations + rôle de l'API
+├── docker-compose.dev.yml   ← développement : postgres + dbmate
+└── .env.example
+```
+
+# Principe
+
+- En production, la base tourne sur l'image durcie `dhi.io/postgres:18` ; en développement, sur l'image officielle `postgres:18`. La version majeure est fixée, car changer de version majeure rend le volume illisible sans migration des données.
+- En production, les images de base sont épinglées par digest : mettre à jour Postgres, c'est changer ce digest dans `docker-compose.yml`. Sans cela, aucun correctif de sécurité n'est récupéré. Dependabot propose ces mises à jour chaque mois.
+- Chaque changement de schéma est un **fichier de migration** dans `db/migrations/`. Il contient une section `up` (appliquer) et une section `down` (annuler).
+- dbmate enregistre les migrations appliquées dans la table `schema_migrations`. `dbmate up` n'exécute **que** celles qui manquent, dans l'ordre de leur horodatage.
+- Chaque migration est exécutée dans une transaction : si elle échoue, rien n'est appliqué.
+- La migration de départ, `20261108120000_baseline`, reproduit exactement le schéma de l'ancien dossier `Database/` de l'API (scripts `001` à `401` et migrations `502` à `505`), colonnes dans le même ordre, ainsi que les méthodes d'authentification (`PASSWORD` = 1, `EMAIL_CODE` = 2) dont l'API a besoin.
+- En production, l'API ne se connecte pas avec le propriétaire de la base, mais avec le rôle `floraccess_api`, qui peut seulement lire et écrire les lignes des tables : ni modifier le schéma, ni toucher à la table `schema_migrations`. Une injection SQL dans l'API ne pourrait donc ni modifier le schéma ni exécuter de code sur le serveur.
+- Le service ponctuel `floraccess-api-role` crée ce rôle, lui donne ses droits et applique le mot de passe de `secrets/api_db_password`. Il tourne à chaque déploiement, après les migrations : une nouvelle table est donc accessible à l'API sans rien faire de plus.
+
+# Règles à respecter
+
+- **Ne jamais modifier une migration déjà appliquée en production.** Pour corriger, on crée une nouvelle migration.
+- **Ne jamais modifier le schéma de production à la main** (psql, DBeaver...). Tout passe par une migration.
+- **Une migration = un changement logique**, petit et facile à relire.
+- **Toujours écrire la section `down`** et la tester en local.
+- **Changements destructifs en deux temps** (supprimer ou renommer une colonne utilisée par l'API) :
+  1. déployer une API qui n'utilise plus la colonne ;
+  2. déployer ensuite la migration qui la supprime.
+- **Pas de données de test dans les migrations.** Seules les données de référence indispensables au fonctionnement y ont leur place (comme les méthodes d'authentification).
+- **Faire une sauvegarde avant chaque déploiement** en production.
+
+# Développement
+
+Copier le fichier d'environnement. Les variables de développement y sont commentées car elles ont une valeur par défaut : les décommenter seulement pour les changer (`HOST_UID` et `HOST_GID` : résultats de `id -u` et `id -g`).
+
+```bash
+cp .env.example .env
+```
+
+Démarrer la base et appliquer toutes les migrations :
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+```
+
+`floraccess-migrate` applique les migrations, régénère `db/schema.sql`, puis s'arrête. La base reste accessible sur `127.0.0.1:${DB_PORT}` (5432 par défaut), et l'API en développement la joint via le réseau `floraccess-net`, avec `DB_HOST=floraccess-database`.
+
+Commandes dbmate utiles (aucune installation nécessaire, tout passe par Docker) :
+
+```bash
+docker compose -f docker-compose.dev.yml run --rm floraccess-migrate status
+```
+
+```bash
+docker compose -f docker-compose.dev.yml run --rm floraccess-migrate up
+```
+
+```bash
+docker compose -f docker-compose.dev.yml run --rm floraccess-migrate rollback
+```
+
+- `status` : liste les migrations appliquées et en attente.
+- `up` : applique les migrations en attente et régénère `db/schema.sql`.
+- `rollback` : annule la dernière migration appliquée (section `down`).
+
+Repartir d'une base vide (⚠️ supprime les données de développement) :
+
+```bash
+docker compose -f docker-compose.dev.yml down -v
+```
+
+# Créer une migration
+
+1. Générer le fichier (le nom décrit le changement, en anglais, en snake_case) :
+
+    ```bash
+    docker compose -f docker-compose.dev.yml run --rm floraccess-migrate new add_avatar_to_users
+    ```
+
+    dbmate crée `db/migrations/<horodatage>_add_avatar_to_users.sql`.
+
+2. Remplir les deux sections :
+
+    ```sql
+    -- migrate:up
+    ALTER TABLE users ADD COLUMN avatar_url VARCHAR(1024);
+
+    -- migrate:down
+    ALTER TABLE users DROP COLUMN avatar_url;
+    ```
+
+3. Tester : `up`, puis `rollback`, puis `up` (voir [Développement](#développement)).
+4. Adapter l'API si nécessaire (repositories, schémas zod...).
+5. Commiter la migration **et** `db/schema.sql`. Le diff de `schema.sql` montre l'effet réel du changement.
+
+Une nouvelle table n'a pas besoin de `GRANT` pour l'API : `floraccess-api-role` lui donne ses droits au déploiement suivant.
+
+Pour modifier une fonction ou un trigger, créer une nouvelle migration avec `CREATE OR REPLACE FUNCTION ...` dans `up`, et l'ancienne définition dans `down`.
+
+# Publier l'image de migrations
+
+L'image `florobart/floraccess-migrations` contient dbmate et toutes les migrations. Au démarrage, elle applique les migrations en attente, puis s'arrête.
+
+**Automatiquement (GitHub Actions)** : à chaque merge sur `main`, la CI ([FloRobart/github-ci](https://github.com/FloRobart/github-ci), type `database`) teste les migrations sur une base vide, puis publie l'image sur Docker Hub et GHCR avec les tags `<version>` et `latest`.
+
+Les secrets `DOCKERHUB_USERNAME` et `DOCKERHUB_TOKEN` doivent être configurés dans le dépôt GitHub (Actions **et** Dependabot, à cause de `dhi.io`).
+
+**À la main** :
+
+```bash
+docker build -t florobart/floraccess-migrations:1.0.0 -t florobart/floraccess-migrations:latest .
+```
+
+```bash
+docker push --all-tags florobart/floraccess-migrations
+```
+
+# Déployer en production
+
+En production, [floraccess-wrapper](https://github.com/FloRobart/floraccess-wrapper) déploie ce dépôt avec le reste de l'écosystème : il crée les secrets, sauvegarde la base, applique les migrations, puis démarre l'API. Voir son README.
+
+Cette section décrit comment lancer ce dépôt seul, depuis le dossier contenant son `docker-compose.yml` et son `.env`.
+
+**Toujours déployer la base avant l'API.** L'API a besoin du schéma à jour et de son rôle.
+
+Prérequis, à préparer une seule fois :
+
+- Le serveur doit être authentifié sur le registre des images durcies :
+
+    ```bash
+    docker login dhi.io
+    ```
+
+- Les secrets doivent exister dans le dossier `secrets/` (jamais commité) :
+
+    - `secrets/db_password` : le mot de passe de la base, seul dans le fichier ;
+    - `secrets/migrations.env` : une seule ligne, avec le mot de passe encodé pour une URL :
+
+        ```
+        DATABASE_URL=postgres://<DB_USER>:<DB_PASSWORD>@floraccess-database:5432/<DB_NAME>?sslmode=disable
+        ```
+
+    - `secrets/api_db_password` : le mot de passe du rôle `floraccess_api` de l'API, seul dans le fichier, avec des lettres et des chiffres uniquement.
+
+    Pour générer un mot de passe avec des lettres et des chiffres uniquement :
+
+    ```bash
+    openssl rand -hex 32
+    ```
+
+    Le dossier protège les fichiers sur l'hôte. Les fichiers restent lisibles, car les conteneurs les lisent avec un utilisateur non-root :
+
+    ```bash
+    chmod 700 secrets
+    ```
+
+    ```bash
+    chmod 644 secrets/db_password secrets/migrations.env secrets/api_db_password
+    ```
+
+Déploiement :
+
+1. Sauvegarder la base. Sans les droits, qui nomment le rôle de l'API : il n'existe pas encore dans une base vide, et la restauration échouerait. `floraccess-api-role` les redonne au déploiement suivant :
+
+    ```bash
+    docker compose exec floraccess-database pg_dump --no-privileges -U <DB_USER> -d <DB_NAME> > backup_$(date +%F).sql
+    ```
+
+2. Récupérer les images. La dernière release est prise par défaut ; pour une autre version, la définir dans `MIGRATIONS_VERSION` :
+
+    ```bash
+    docker compose pull
+    ```
+
+3. Démarrer. La base démarre, puis `floraccess-migrate` applique **uniquement** les migrations manquantes et s'arrête. `floraccess-api-role` donne ensuite au rôle de l'API ses droits et son mot de passe, puis s'arrête à son tour :
+
+    ```bash
+    docker compose up -d
+    ```
+
+4. Vérifier que les migrations et le rôle de l'API sont passés (les deux services doivent être `Exited (0)`) :
+
+    ```bash
+    docker compose ps -a
+    ```
+
+    ```bash
+    docker compose logs floraccess-migrate floraccess-api-role
+    ```
+
+5. Déployer ensuite l'API, depuis son propre dossier, avec `DB_USER=floraccess_api` dans son `.env` et le mot de passe de `secrets/api_db_password` dans son fichier `secrets/db_password`.
+
+S'il n'y a aucune migration en attente, `floraccess-migrate` ne fait rien. On peut relancer `docker compose up -d` autant de fois que nécessaire.
+
+# En cas de problème
+
+- **La migration échoue** : elle est annulée (transaction), la base reste dans son état précédent et `floraccess-migrate` se termine en erreur (`Exited (1)`). Ne pas déployer la nouvelle API. Corriger avec une nouvelle migration, publier une nouvelle image, redéployer.
+- **La migration passe mais elle est fausse** : écrire une nouvelle migration corrective. En dernier recours, restaurer la sauvegarde.
+- **Le `rollback` est réservé au développement.** En production, on corrige vers l'avant.
+
+# Basculer une base existante
+
+À faire **une seule fois**, sur la base créée avec l'ancien système (dossier `Database/` de l'ancien dépôt `FlorAccess_server`, scripts dans `docker-entrypoint-initdb.d`). Les tables existent déjà, donc la migration `20261108120000_baseline` ne doit **pas** être exécutée. Il faut la marquer comme appliquée.
+
+⚠️ Le volume de l'ancienne base **n'est pas réutilisable** : l'image durcie n'utilise ni le même dossier de données (`18/data` au lieu de `18/docker`) ni le même utilisateur (UID 70 au lieu de 999). Les données passent donc par une sauvegarde et une restauration, dans un nouveau volume.
+
+⚠️ Avec l'ancien `docker-compose.yml` de `Flower_garden`, le volume nommé était monté sur `/var/lib/postgresql/floraccess_db_data`, qui n'est pas le dossier de données de PostgreSQL : les données réelles sont probablement dans un **volume anonyme**. La sauvegarde de l'étape 1 suffit, mais pour garder une solution de repli, noter ce volume **avant** d'arrêter l'ancienne stack, et ne jamais lancer `docker compose down -v` sur l'ancienne stack :
+
+```bash
+docker inspect <CONTENEUR_DB> --format '{{ range .Mounts }}{{ .Name }} -> {{ .Destination }}{{ "\n" }}{{ end }}'
+```
+
+1. Sauvegarder la base, depuis le dossier de l'ancien `docker-compose.yml`. Sans propriétaire ni droits : la restauration fonctionne ainsi quel que soit `DB_USER` dans la nouvelle base :
+
+    ```bash
+    docker compose exec -T <SERVICE_DB> pg_dump --no-owner --no-privileges -U <DB_USER> -d <DB_NAME> > backup.sql
+    ```
+
+2. Vérifier la sauvegarde : elle doit contenir les deux tables et les utilisateurs.
+
+    ```bash
+    grep -E "^CREATE TABLE|^COPY" backup.sql
+    ```
+
+3. Vérifier la version de PostgreSQL utilisée. Elle doit être la même que celle de `docker-compose.yml` (PostgreSQL 18) :
+
+    ```bash
+    docker compose exec <SERVICE_DB> psql -U <DB_USER> -d <DB_NAME> -c "SELECT version();"
+    ```
+
+4. Vérifier que l'ancienne base a bien reçu les migrations `502` à `505`. La requête doit renvoyer exactement ces 19 colonnes, dans cet ordre : `id`, `email`, `pseudo`, `auth_methods_id`, `is_connected`, `is_verified_email`, `last_login`, `last_ip`, `email_verify_token_hash`, `secret_hash`, `token_hash`, `created_at`, `updated_at`, `last_logout_at`, `is_admin`, `login_requested_at`, `login_code_attempts`, `login_block_token_hash`, `login_blocked_until`. S'il en manque, ne pas continuer : appliquer d'abord sur l'ancienne base les fichiers `5xx` manquants, puis reprendre à l'étape 1.
+
+    ```bash
+    docker compose exec <SERVICE_DB> psql -U <DB_USER> -d <DB_NAME> -Atc "SELECT column_name FROM information_schema.columns WHERE table_name = 'users' ORDER BY ordinal_position;"
+    ```
+
+5. Indiquer dans `DB_VOLUME_NAME` du `.env` de ce dépôt un nom de volume **différent** de l'ancien. L'ancien volume reste intact et sert de solution de repli.
+
+6. Arrêter l'ancienne stack (sans `-v`, pour **garder** les volumes), depuis le dossier de l'ancien `docker-compose.yml` :
+
+    ```bash
+    docker compose down
+    ```
+
+7. Démarrer uniquement la base avec ce dépôt :
+
+    ```bash
+    docker compose up -d --wait floraccess-database
+    ```
+
+8. Restaurer la sauvegarde :
+
+    ```bash
+    docker compose exec -T floraccess-database sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < backup.sql
+    ```
+
+9. Marquer la migration de départ comme appliquée :
+
+    ```bash
+    echo "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(128) PRIMARY KEY); INSERT INTO schema_migrations (version) VALUES ('20261108120000') ON CONFLICT DO NOTHING;" | docker compose exec -T floraccess-database sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+    ```
+
+10. Vérifier que dbmate ne voit aucune migration en attente (`Pending: 0`) :
+
+    ```bash
+    docker compose run --rm floraccess-migrate --no-dump-schema status
+    ```
+
+11. Démarrer le reste (rôle de l'API compris), puis l'API :
+
+    ```bash
+    docker compose up -d
+    ```
+
+Tout scénario de bascule se répète d'abord en local, avec la vraie sauvegarde.
